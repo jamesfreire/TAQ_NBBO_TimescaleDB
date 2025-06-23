@@ -5,8 +5,7 @@ High-performance financial market data pipeline processing 440M+ daily NBBO reco
 
 ## Quick Start
 1. Clone this repository
-2. Read the `taq_nbbo_timescaledb.sql` file
-3. Follow the workflow instructions in the SQL file
+2. Follow the workflow instructions in `taq_nbbo_timescaledb.sql` file
 
 ## Files
 - `taq_nbbo_timescaledb.sql` - Complete database setup, functions, and example queries
