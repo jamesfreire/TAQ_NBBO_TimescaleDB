@@ -183,6 +183,17 @@ $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 -- 5. DATA VALIDATION FUNCTIONS
 -- =============================================================================
 
+CREATE OR REPLACE FUNCTION is_regular_trading_hours(
+    data_date DATE,
+    taq_timestamp BIGINT
+) RETURNS BOOLEAN AS $$
+BEGIN
+    -- 9:30 AM = 093000000000000, 4:00 PM = 160000000000000
+    RETURN taq_timestamp >= 093000000000000 AND taq_timestamp <= 160000000000000;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
+
+
 -- Validate imported data for a specific date
 CREATE OR REPLACE FUNCTION validate_nbbo_data(target_date DATE)
 RETURNS TABLE (
