@@ -9,8 +9,6 @@
 -- 1. TABLE CREATION
 -- =============================================================================
 
-DROP TABLE IF EXISTS taq_nbbo CASCADE;
-
 CREATE TABLE taq_nbbo (
     -- Import and data tracking
     import_date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -63,22 +61,58 @@ CREATE TABLE taq_nbbo (
     security_status_indicator CHAR(2),
     
     -- Import tracking
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Constraints
-    CONSTRAINT chk_time_range CHECK (time >= 0 AND time <= 999999999999999), -- 15-digit HHMMSSxxxxxxxxx format
-    CONSTRAINT chk_data_integrity CHECK (
-        sequence_number IS NOT NULL AND 
-        symbol IS NOT NULL AND 
-        exchange IS NOT NULL
-    )
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    	)
+    WITH (
+  tsdb.hypertable,
+  tsdb.partition_column = 'data_date',
+  tsdb.chunk_interval = '1 day',
+  tsdb.segmentby = 'symbol, exchange',
+  tsdb.orderby = 'data_date, time DESC',
+  tsdb.create_default_indexes = false
 );
 
+
 -- =============================================================================
--- 2. UTILITY FUNCTIONS
+-- 2. INDEXES FOR OPTIMAL QUERY PERFORMANCE
+-- =============================================================================
+
+-- Primary index for time-series queries
+CREATE INDEX idx_taq_nbbo_data_date_time 
+ON taq_nbbo (data_date, time);
+
+-- Symbol-based queries (most common)
+CREATE INDEX idx_taq_nbbo_symbol_data_date 
+ON taq_nbbo (symbol, data_date, time);
+
+-- Exchange-based analysis
+CREATE INDEX idx_taq_nbbo_exchange_data_date 
+ON taq_nbbo (exchange, data_date, time);
+
+-- Sequence number for data integrity checks
+CREATE INDEX idx_taq_nbbo_sequence 
+ON taq_nbbo (data_date, sequence_number);
+
+-- =============================================================================
+-- 3. COMPRESSION CONFIGURATION
+-- =============================================================================
+
+-- Configure compression for optimal storage and query performance
+ALTER TABLE taq_nbbo SET (
+    timescaledb.compress,
+    timescaledb.compress_orderby = 'time DESC, sequence_number DESC',
+    timescaledb.compress_segmentby = 'data_date, symbol, exchange'
+);
+
+-- Compression policy - compress data older than 1 day
+SELECT add_compression_policy('taq_nbbo', INTERVAL '1 day');
+
+-- =============================================================================
+-- 4. UTILITY FUNCTIONS FOR TIME CONVERSION
 -- =============================================================================
 
 -- Convert TAQ timestamp (HHMMSSxxxxxxxxx format) to market time
+
 CREATE OR REPLACE FUNCTION ns_to_market_time(
     data_date DATE,
     taq_timestamp BIGINT,
@@ -144,19 +178,9 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
--- Check if timestamp falls within regular trading hours (9:30 AM - 4:00 PM ET)
-CREATE OR REPLACE FUNCTION is_regular_trading_hours(
-    data_date DATE,
-    taq_timestamp BIGINT
-) RETURNS BOOLEAN AS $$
-BEGIN
-    -- 9:30 AM = 093000000000000, 4:00 PM = 160000000000000
-    RETURN taq_timestamp >= 093000000000000 AND taq_timestamp <= 160000000000000;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE;
 
 -- =============================================================================
--- 3. DATA VALIDATION FUNCTIONS
+-- 5. DATA VALIDATION FUNCTIONS
 -- =============================================================================
 
 -- Validate imported data for a specific date
@@ -237,6 +261,34 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+
+-- Materialized view for daily summary statistics (refresh after daily load)
+CREATE MATERIALIZED VIEW daily_nbbo_summary AS
+SELECT 
+    data_date,
+    symbol,
+    COUNT(*) as total_quotes,
+    COUNT(*) FILTER (WHERE is_regular_trading_hours(data_date, time)) as trading_hours_quotes,
+    AVG(best_offer_price - best_bid_price) as avg_spread,
+    MIN(best_offer_price - best_bid_price) as min_spread,
+    MAX(best_offer_price - best_bid_price) as max_spread,
+    AVG(best_bid_price) as avg_bid,
+    AVG(best_offer_price) as avg_offer,
+    MIN(time) as first_quote_ns,
+    MAX(time) as last_quote_ns,
+    COUNT(DISTINCT exchange) as exchange_count,
+    COUNT(DISTINCT best_bid_exchange) as bid_exchange_count,
+    COUNT(DISTINCT best_offer_exchange) as offer_exchange_count
+FROM taq_nbbo
+WHERE best_bid_price > 0 AND best_offer_price > 0
+GROUP BY data_date, symbol;
+
+-- Index on materialized view
+CREATE INDEX idx_daily_nbbo_summary_date_symbol ON daily_nbbo_summary (data_date, symbol);
+
+
+
+
 -- Calculate daily NBBO statistics
 CREATE OR REPLACE FUNCTION daily_nbbo_stats(target_date DATE)
 RETURNS TABLE (
@@ -273,124 +325,22 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- =============================================================================
--- WORKFLOW INSTRUCTIONS
--- =============================================================================
-
-/*
-COMPLETE WORKFLOW FOR TAQ NBBO DATA PROCESSING:
-
-1. CREATE TABLE AND FUNCTIONS (Execute SQL above)
-
-2. PREPROCESS TAQ FILE:
-   # Remove headers and footers from TAQ file
-   sed '1d;$d' EQY_US_ALL_NBBO_20250102 > CLEAN_EQY_US_ALL_NBBO_20250102
-   
-   # Add date column (extracted from filename)
-   sed "s/^/2025-01-02|/" CLEAN_EQY_US_ALL_NBBO_20250102 > DATA_DATE_CLEAN_EQY_US_ALL_NBBO_20250102
-
-3. PARALLEL COPY IMPORT:
-   timescaledb-parallel-copy \
-     --connection "host=localhost user=postgres sslmode=disable dbname=postgres" \
-     --table taq_nbbo \
-     --file "DATA_DATE_CLEAN_EQY_US_ALL_NBBO_20250102" \
-     --workers 16 \
-     --batch-size 50000 \
-     --reporting-period 10s \
-     --split "|" \
-     --copy-options "CSV" \
-     --columns "data_date,time,exchange,symbol,bid_price,bid_size,offer_price,offer_size,quote_condition,sequence_number,national_bbo_indicator,finra_bbo_indicator,finra_adf_mpid_indicator,quote_cancel_correction,source_of_quote,best_bid_quote_condition,best_bid_exchange,best_bid_price,best_bid_size,best_bid_finra_market_maker_id,best_offer_quote_condition,best_offer_exchange,best_offer_price,best_offer_size,best_offer_finra_market_maker_id,luld_bbo_indicator,nbbo_luld_indicator,sip_generated_message_identifier,participant_timestamp,finra_adf_timestamp,security_status_indicator"
-
-4. CREATE HYPERTABLE:
-*/
-
-SELECT create_hypertable(
-    'taq_nbbo', 
-    'data_date',
-    chunk_time_interval => INTERVAL '1 day',
-    migrate_data => true
-);
-
-/*
-5. CREATE INDEXES:
-*/
-
--- Primary index for time-series queries
-CREATE INDEX idx_taq_nbbo_data_date_time 
-ON taq_nbbo (data_date, time);
-
--- Symbol-based queries (most common)
-CREATE INDEX idx_taq_nbbo_symbol_data_date 
-ON taq_nbbo (symbol, data_date, time);
-
--- Exchange-based analysis
-CREATE INDEX idx_taq_nbbo_exchange_data_date 
-ON taq_nbbo (exchange, data_date, time);
-
--- Sequence number for data integrity checks
-CREATE INDEX idx_taq_nbbo_sequence 
-ON taq_nbbo (data_date, sequence_number);
-
-/*
-6. CONFIGURE COMPRESSION:
-*/
-
--- Configure compression for optimal storage and query performance
-ALTER TABLE taq_nbbo SET (
-    timescaledb.compress,
-    timescaledb.compress_orderby = 'time DESC, sequence_number DESC',
-    timescaledb.compress_segmentby = 'data_date, symbol, exchange'
-);
-
--- Compression policy - compress data older than 1 day
-SELECT add_compression_policy('taq_nbbo', INTERVAL '1 day');
-
-/*
-7. POST-IMPORT VALIDATION:
-*/
-
--- Validate the imported data
-SELECT * FROM validate_nbbo_data('2025-01-02');
-
-/*
-8. CREATE MATERIALIZED VIEW FOR PERFORMANCE:
-*/
-
--- Materialized view for daily summary statistics (refresh after daily load)
-CREATE MATERIALIZED VIEW daily_nbbo_summary AS
-SELECT 
-    data_date,
-    symbol,
-    COUNT(*) as total_quotes,
-    COUNT(*) FILTER (WHERE is_regular_trading_hours(data_date, time)) as trading_hours_quotes,
-    AVG(best_offer_price - best_bid_price) as avg_spread,
-    MIN(best_offer_price - best_bid_price) as min_spread,
-    MAX(best_offer_price - best_bid_price) as max_spread,
-    AVG(best_bid_price) as avg_bid,
-    AVG(best_offer_price) as avg_offer,
-    MIN(time) as first_quote_ns,
-    MAX(time) as last_quote_ns,
-    COUNT(DISTINCT exchange) as exchange_count,
-    COUNT(DISTINCT best_bid_exchange) as bid_exchange_count,
-    COUNT(DISTINCT best_offer_exchange) as offer_exchange_count
-FROM taq_nbbo
-WHERE best_bid_price > 0 AND best_offer_price > 0
-GROUP BY data_date, symbol;
-
--- Index on materialized view
-CREATE INDEX idx_daily_nbbo_summary_date_symbol ON daily_nbbo_summary (data_date, symbol);
 
 -- =============================================================================
--- EXAMPLE QUERIES AND ANALYSIS
+-- Market Analysis Examples
 -- =============================================================================
 
 
--- Daily Spread Statistics by Symbol: 1m53s execution, 0.002s fetch
+-- Daily Spread Statistics by Symbol:
+
 SELECT * FROM daily_nbbo_stats('2025-01-02') 
 WHERE symbol IN ('AAPL', 'MSFT')
 ORDER BY avg_spread;
 
--- Market Snapshot at Specific Time (2:30 PM = 143000000000000 in TAQ format)
+
+
+-- Get NBBO snapshot at specific time using TAQ timestamp format
+2:30 PM = 143000000000000 (HHMMSSxxxxxxxxx)
 WITH latest_quotes AS (
     SELECT DISTINCT ON (symbol)
         symbol,
@@ -414,8 +364,8 @@ WITH latest_quotes AS (
 SELECT * FROM latest_quotes 
 WHERE spread IS NOT NULL
 ORDER BY symbol;
+Market open snapshot (9:30 AM): 0.21 seconds
 
--- Market Open Snapshot (9:30 AM): 0.21 seconds execution
 SELECT 
     symbol,
     best_bid_price,
@@ -432,7 +382,9 @@ WHERE data_date = '2025-01-02'
 ORDER BY symbol, time DESC
 LIMIT 100;
 
--- Cross-sectional Analysis: Widest Spreads at Market Close: 12 seconds execution
+
+-- Cross-sectional analysis: widest spreads at market close: 12 seconds
+
 WITH close_quotes AS (
     SELECT DISTINCT ON (symbol)
         symbol,
@@ -453,7 +405,8 @@ FROM close_quotes
 ORDER BY spread DESC
 LIMIT 20;
 
--- Time Series Analysis: AAPL quotes during first hour of trading
+
+-- AAPL quotes during first hour of trading
 SELECT 
     ns_to_market_time(data_date, time) as market_time,
     best_bid_price, 
@@ -466,22 +419,4 @@ WHERE symbol = 'AAPL'
   AND time <= 103000000000000  -- 10:30 AM
 ORDER BY time;
 
--- Performance Monitoring Queries
 
--- Check compression ratio
-SELECT 
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as total_size,
-    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) as table_size
-FROM pg_tables 
-WHERE tablename = 'taq_nbbo';
-
--- Check chunk information
-SELECT * FROM timescaledb_information.chunks WHERE hypertable_name = 'taq_nbbo';
-
--- Check compression status
-SELECT * FROM timescaledb_information.compression_settings WHERE hypertable_name = 'taq_nbbo';
-
--- Refresh materialized view after daily load
-REFRESH MATERIALIZED VIEW daily_nbbo_summary;
