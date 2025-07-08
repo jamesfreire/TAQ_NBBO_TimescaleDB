@@ -12,6 +12,6 @@ High-performance financial market data pipeline processing 440M+ daily NBBO reco
 
 
 ## Performance
-- Processes 440M records in 57 minutes
+- Processes 440M records in 30 minutes
 - Sub-second query times for most analysis patterns
 - Maintains full nanosecond precision
